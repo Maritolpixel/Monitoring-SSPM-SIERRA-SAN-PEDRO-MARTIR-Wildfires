@@ -28,6 +28,7 @@ var CONFIG = {
   scale:          20,
 
   // Delimitación del perímetro
+  useFirmsGuide:  true,                 // false = buscar cicatrices en toda la ANP (sin FIRMS)
   firmsBufferM:   1500,                 // zona de búsqueda alrededor de focos FIRMS
   dnbrCandidate:  0.10,                 // píxel candidato a quemado
   mmuPixels:      25,                   // unidad mínima de mapeo (25 px × 400 m² = 1 ha)
@@ -108,10 +109,15 @@ var firms = ee.ImageCollection('FIRMS')
   .filterBounds(aoi)
   .filterDate(CONFIG.fireStart, ee.Date(CONFIG.fireEnd).advance(1, 'day'))
   .select('T21');
-var focos = firms.max().gt(0).selfMask();
-var zonaBusqueda = focos.focal_max({radius: CONFIG.firmsBufferM, kernelType: 'circle', units: 'meters'})
+var nFirms = firms.size();
+print('Detecciones FIRMS en la ventana del evento:', nFirms);
+// Si no hay imágenes FIRMS, firms.max() no tiene bandas; se usa una imagen vacía en su lugar.
+var focos = ee.Image(ee.Algorithms.If(nFirms.gt(0),
+  firms.max().gt(0).selfMask(),
+  ee.Image(0).selfMask())).rename('foco');
+var zonaFirms = focos.focal_max({radius: CONFIG.firmsBufferM, kernelType: 'circle', units: 'meters'})
   .clip(aoi);
-print('Detecciones FIRMS en la ventana del evento:', firms.size());
+var zonaBusqueda = CONFIG.useFirmsGuide ? zonaFirms : ee.Image(1).clip(aoi);
 
 // Candidatos: dNBR alto dentro de la zona de búsqueda, suavizado, con unidad mínima de mapeo
 var candidato = dNBR.gte(CONFIG.dnbrCandidate)
@@ -131,6 +137,20 @@ var perimetro = quemado.reduceToVectors({
   labelProperty: 'quemado',
   maxPixels: 1e9
 }).union(CONFIG.scale);
+
+// ----------------------------- 4b. Diagnóstico ----------------------------
+// Hectáreas que sobreviven en cada paso. El primer valor en 0 indica dónde se pierde la señal.
+function ha(img) {
+  return ee.Image.pixelArea().updateMask(img).reduceRegion({
+    reducer: ee.Reducer.sum(), geometry: aoi, scale: CONFIG.scale * 5, maxPixels: 1e9
+  }).values().get(0);
+}
+print('--- DIAGNÓSTICO (ha, aproximado) ---');
+print('a) Píxeles con dato en dNBR:',        ee.Number(ha(dNBR.mask())).divide(1e4));
+print('b) dNBR >= candidato en toda la ANP:', ee.Number(ha(dNBR.gte(CONFIG.dnbrCandidate))).divide(1e4));
+print('c) Zona de búsqueda (FIRMS + buffer):', ee.Number(ha(zonaBusqueda)).divide(1e4));
+print('d) Candidatos dentro de la zona:',     ee.Number(ha(candidato.selfMask())).divide(1e4));
+print('e) Tras unidad mínima de mapeo:',      ee.Number(ha(quemado)).divide(1e4));
 
 // ----------------------------- 5. Estadísticas ----------------------------
 function areaPorClase(sevImg, nombre) {
