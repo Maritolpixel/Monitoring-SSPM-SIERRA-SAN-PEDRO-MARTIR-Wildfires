@@ -31,7 +31,12 @@ var CONFIG = {
   useFirmsGuide:  true,                 // false = buscar cicatrices en toda la ANP (sin FIRMS)
   firmsBufferM:   1500,                 // zona de búsqueda alrededor de focos FIRMS
   dnbrCandidate:  0.10,                 // píxel candidato a quemado
-  mmuPixels:      25,                   // unidad mínima de mapeo (25 px × 400 m² = 1 ha)
+  // Unidad mínima de mapeo. 'opening' = apertura morfológica (barata, recomendada).
+  // 'connected' = connectedPixelCount exacto, pero agota la memoria en modo interactivo:
+  // úsalo solo dentro de un Export, nunca con print().
+  mmuMethod:      'opening',
+  mmuRadiusPx:    3,                    // radio de la apertura; 3 px ≈ descarta manchas < ~1 ha
+  mmuPixels:      25,                   // solo para mmuMethod 'connected' (25 px × 400 m² = 1 ha)
 
   // Umbrales dNBR (Key & Benson 2006). Calibrados en bosques de EE. UU.; validar localmente.
   dnbrBreaks:     [0.10, 0.27, 0.44, 0.66],
@@ -57,8 +62,11 @@ var aoi = anp.geometry();
 
 Map.centerObject(aoi, 11);
 Map.setOptions('SATELLITE');
-print('ANP:', anp.first().get('NAME'), '| WDPAID:', anp.first().get('WDPAID'),
+// Nota: el nombre exacto del campo de ID cambia entre versiones de WDPA. Se imprimen las
+// propiedades de la primera entidad para localizarlo y fijarlo en CONFIG.wdpaId si hace falta.
+print('ANP:', anp.first().get('NAME'), '| Polígonos:', anp.size(),
       '| Superficie ANP (ha):', aoi.area(1).divide(1e4));
+print('Propiedades WDPA (para identificar el campo de ID):', anp.first().toDictionary());
 
 // ----------------------------- 2. Sentinel-2 ------------------------------
 var csPlus = ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED');
@@ -124,18 +132,34 @@ var zonaGeom = CONFIG.useFirmsGuide
         geometryType: 'polygon', eightConnected: true, maxPixels: 1e8
       }).geometry().buffer(CONFIG.firmsBufferM).intersection(aoi, 100)
   : aoi;
-var zonaBusqueda = ee.Image(1).clip(zonaGeom);
 print('Zona de búsqueda (ha):', zonaGeom.area(100).divide(1e4));
 
 // Candidatos: dNBR alto dentro de la zona de búsqueda, suavizado, con unidad mínima de mapeo
 var candidato = dNBR.gte(CONFIG.dnbrCandidate)
   .clip(zonaGeom)
   .focal_mode({radius: 1, kernelType: 'square', units: 'pixels'});
-var quemado = candidato.selfMask()
-  .connectedPixelCount({maxSize: 1024, eightConnected: true})
-  .gte(CONFIG.mmuPixels)
-  .selfMask()
-  .rename('quemado');
+// Unidad mínima de mapeo.
+// 'opening': erosión seguida de dilatación. Elimina manchas más pequeñas que el elemento
+// estructurante y devuelve las grandes a su tamaño original. Es una operación de vecindad
+// fija, así que su costo es constante por píxel.
+// 'connected': etiquetado de componentes conexos. Es exacto, pero cada píxel debe recorrer
+// su región completa; sobre una cicatriz de cientos de hectáreas eso excede la memoria
+// interactiva. Solo apto dentro de un Export.
+var bin = candidato.unmask(0).gt(0);
+var quemado;
+if (CONFIG.mmuMethod === 'connected') {
+  quemado = bin.selfMask()
+    .connectedPixelCount({maxSize: 256, eightConnected: true})
+    .gte(CONFIG.mmuPixels)
+    .selfMask();
+} else {
+  var r = CONFIG.mmuRadiusPx;
+  quemado = bin
+    .focal_min({radius: r, kernelType: 'circle', units: 'pixels'})
+    .focal_max({radius: r, kernelType: 'circle', units: 'pixels'})
+    .selfMask();
+}
+quemado = quemado.rename('quemado').clip(zonaGeom);
 
 // Vector del perímetro: SOLO se materializa en el exporte (sección 7). No se dibuja ni se
 // imprime en la sesión interactiva porque la vectorización a 20 m agota la memoria.
