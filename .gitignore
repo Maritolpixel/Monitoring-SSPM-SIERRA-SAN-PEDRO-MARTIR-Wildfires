@@ -1,0 +1,5 @@
+# Local exports from GEE (Drive downloads)
+*.tif
+*.geojson
+*.csv
+!assets/**
