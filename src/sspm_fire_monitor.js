@@ -115,13 +115,21 @@ print('Detecciones FIRMS en la ventana del evento:', nFirms);
 var focos = ee.Image(ee.Algorithms.If(nFirms.gt(0),
   firms.max().gt(0).selfMask(),
   ee.Image(0).selfMask())).rename('foco');
-var zonaFirms = focos.focal_max({radius: CONFIG.firmsBufferM, kernelType: 'circle', units: 'meters'})
-  .clip(aoi);
-var zonaBusqueda = CONFIG.useFirmsGuide ? zonaFirms : ee.Image(1).clip(aoi);
+// Zona de búsqueda como GEOMETRÍA: los focos (1 km) se vectorizan a baja resolución, se les
+// aplica el buffer y se recortan a la ANP. Todo lo pesado (conteo de píxeles conectados,
+// estadísticas, vectorización) se limita a esta geometría en lugar de a toda la ANP.
+var zonaGeom = CONFIG.useFirmsGuide
+  ? focos.reduceToVectors({
+        geometry: aoi.buffer(CONFIG.firmsBufferM), scale: 1000,
+        geometryType: 'polygon', eightConnected: true, maxPixels: 1e8
+      }).geometry().buffer(CONFIG.firmsBufferM).intersection(aoi, 100)
+  : aoi;
+var zonaBusqueda = ee.Image(1).clip(zonaGeom);
+print('Zona de búsqueda (ha):', zonaGeom.area(100).divide(1e4));
 
 // Candidatos: dNBR alto dentro de la zona de búsqueda, suavizado, con unidad mínima de mapeo
 var candidato = dNBR.gte(CONFIG.dnbrCandidate)
-  .updateMask(zonaBusqueda)
+  .clip(zonaGeom)
   .focal_mode({radius: 1, kernelType: 'square', units: 'pixels'});
 var quemado = candidato.selfMask()
   .connectedPixelCount({maxSize: 1024, eightConnected: true})
@@ -129,35 +137,37 @@ var quemado = candidato.selfMask()
   .selfMask()
   .rename('quemado');
 
+// Vector del perímetro: SOLO se materializa en el exporte (sección 7). No se dibuja ni se
+// imprime en la sesión interactiva porque la vectorización a 20 m agota la memoria.
 var perimetro = quemado.reduceToVectors({
-  geometry: aoi,
+  geometry: zonaGeom,
   scale: CONFIG.scale,
   geometryType: 'polygon',
   eightConnected: true,
   labelProperty: 'quemado',
   maxPixels: 1e9
-}).union(CONFIG.scale);
+});
 
 // ----------------------------- 4b. Diagnóstico ----------------------------
 // Hectáreas que sobreviven en cada paso. El primer valor en 0 indica dónde se pierde la señal.
-function ha(img) {
-  return ee.Image.pixelArea().updateMask(img).reduceRegion({
-    reducer: ee.Reducer.sum(), geometry: aoi, scale: CONFIG.scale * 5, maxPixels: 1e9
-  }).values().get(0);
+function ha(img, geom, scale) {
+  return ee.Number(ee.Image.pixelArea().updateMask(img).reduceRegion({
+    reducer: ee.Reducer.sum(), geometry: geom, scale: scale, maxPixels: 1e9, tileScale: 4
+  }).values().get(0)).divide(1e4);
 }
+var s5 = CONFIG.scale * 5;   // resolución gruesa para los conteos sobre toda la ANP
 print('--- DIAGNÓSTICO (ha, aproximado) ---');
-print('a) Píxeles con dato en dNBR:',        ee.Number(ha(dNBR.mask())).divide(1e4));
-print('b) dNBR >= candidato en toda la ANP:', ee.Number(ha(dNBR.gte(CONFIG.dnbrCandidate))).divide(1e4));
-print('c) Zona de búsqueda (FIRMS + buffer):', ee.Number(ha(zonaBusqueda)).divide(1e4));
-print('d) Candidatos dentro de la zona:',     ee.Number(ha(candidato.selfMask())).divide(1e4));
-print('e) Tras unidad mínima de mapeo:',      ee.Number(ha(quemado)).divide(1e4));
+print('a) Píxeles con dato en dNBR (ANP):',    ha(dNBR.mask(), aoi, s5));
+print('b) dNBR >= candidato en toda la ANP:',  ha(dNBR.gte(CONFIG.dnbrCandidate), aoi, s5));
+print('c) Candidatos dentro de la zona:',      ha(candidato.selfMask(), zonaGeom, CONFIG.scale));
+print('d) Tras unidad mínima de mapeo:',       ha(quemado, zonaGeom, CONFIG.scale));
 
 // ----------------------------- 5. Estadísticas ----------------------------
 function areaPorClase(sevImg, nombre) {
   var stats = ee.Image.pixelArea().addBands(sevImg.updateMask(quemado))
     .reduceRegion({
       reducer: ee.Reducer.sum().group({groupField: 1, groupName: 'clase'}),
-      geometry: aoi, scale: CONFIG.scale, maxPixels: 1e9
+      geometry: zonaGeom, scale: CONFIG.scale, maxPixels: 1e9, tileScale: 4
     });
   var tabla = ee.FeatureCollection(ee.List(stats.get('groups')).map(function (g) {
     g = ee.Dictionary(g);
@@ -172,7 +182,8 @@ function areaPorClase(sevImg, nombre) {
 
 var tablaDNBR  = areaPorClase(sevDNBR,  'dNBR');
 var tablaRdNBR = areaPorClase(sevRdNBR, 'RdNBR');
-var totalHa = perimetro.geometry().area(CONFIG.scale).divide(1e4);
+// Área total en ráster (suma de píxeles quemados); evita vectorizar en la sesión interactiva.
+var totalHa = ha(quemado, zonaGeom, CONFIG.scale);
 
 print('--- SUPERFICIE POR CLASE (dentro del perímetro) ---');
 print('Clases: 0 sin quemar · 1 baja · 2 moderada-baja · 3 moderada-alta · 4 alta');
@@ -191,7 +202,13 @@ Map.addLayer(sevDNBR.updateMask(quemado).updateMask(sevDNBR.gt(0)),
              {min: 1, max: 4, palette: pal}, '3. Severidad dNBR (en perímetro)');
 Map.addLayer(sevRdNBR.updateMask(quemado).updateMask(sevRdNBR.gt(0)),
              {min: 1, max: 4, palette: pal}, '4. Severidad RdNBR (en perímetro)', false);
-Map.addLayer(ee.Image().paint(perimetro, 1, 2), {palette: ['white']}, '5. Perímetro derivado');
+// Contorno del perímetro en ráster (borde de 1 px alrededor de los píxeles quemados)
+var borde = quemado.unmask(0)
+  .focal_max({radius: 1, kernelType: 'square', units: 'pixels'})
+  .subtract(quemado.unmask(0)).selfMask();
+Map.addLayer(borde, {palette: ['white']}, '5. Perímetro derivado');
+Map.addLayer(ee.Image().paint(ee.FeatureCollection([ee.Feature(zonaGeom)]), 1, 1),
+             {palette: ['yellow']}, '5b. Zona de búsqueda', false);
 Map.addLayer(focos, {palette: ['orange']}, '6. Focos FIRMS (evento)');
 Map.addLayer(anp.style({color: 'cyan', fillColor: '00000000', width: 1}), {}, '7. Límite ANP');
 
